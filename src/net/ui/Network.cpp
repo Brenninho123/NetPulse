@@ -1,6 +1,7 @@
 #include <string>
 #include <vector>
 #include <mutex>
+#include <algorithm>
 
 namespace NetPulse {
     namespace Net {
