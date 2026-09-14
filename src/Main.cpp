@@ -4,11 +4,94 @@
 #include <netinet/in.h>
 #include <unistd.h>
 #include <cstring>
+#include <memory>
+#include <vector>
+#include <queue>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <future>
+#include <functional>
+#include <stdexcept>
 
 namespace NetPulse {
+    namespace Net {
+        class ThreadPool {
+        public:
+            explicit ThreadPool(size_t threads) : stop_(false) {
+                for (size_t i = 0; i < threads; ++i) {
+                    workers_.emplace_back([this] {
+                        while (true) {
+                            std::function<void()> task;
+                            {
+                                std::unique_lock<std::mutex> lock(this->queue_mutex_);
+                                this->cv_.wait(lock, [this] {
+                                    return this->stop_ || !this->tasks_.empty();
+                                });
+
+                                if (this->stop_ && this->tasks_.empty()) {
+                                    return;
+                                }
+
+                                task = std::move(this->tasks_.front());
+                                this->tasks_.pop();
+                            }
+                            task();
+                        }
+                    });
+                }
+            }
+
+            template<class F, class... Args>
+            auto enqueue(F&& f, Args&&... args) 
+                -> std::future<typename std::invoke_result<F, Args...>::type> {
+                
+                using return_type = typename std::invoke_result<F, Args...>::type;
+
+                auto task = std::make_shared<std::packaged_task<return_type()>>(
+                    std::bind(std::forward<F>(f), std::forward<Args>(args)...)
+                );
+                
+                std::future<return_type> res = task->get_future();
+                {
+                    std::unique_lock<std::mutex> lock(queue_mutex_);
+
+                    if (stop_) {
+                        throw std::runtime_error("enqueue on stopped ThreadPool");
+                    }
+
+                    tasks_.emplace([task]() { (*task)(); });
+                }
+                cv_.notify_one();
+                return res;
+            }
+
+            ~ThreadPool() {
+                {
+                    std::unique_lock<std::mutex> lock(queue_mutex_);
+                    stop_ = true;
+                }
+                cv_.notify_all();
+                for (std::thread &worker : workers_) {
+                    if (worker.joinable()) {
+                        worker.join();
+                    }
+                }
+            }
+
+        private:
+            std::vector<std::thread> workers_;
+            std::queue<std::function<void()>> tasks_;
+            mutable std::mutex queue_mutex_;
+            std::condition_variable cv_;
+            bool stop_;
+        };
+    }
+
     class Server {
     public:
-        Server(int port) : port_(port), server_fd_(-1) {}
+        Server(int port, size_t thread_pool_size = 4) 
+            : port_(port), server_fd_(-1), pool_(thread_pool_size) {}
 
         ~Server() {
             stop();
@@ -34,7 +117,7 @@ namespace NetPulse {
                 return false;
             }
 
-            if (listen(server_fd_, 10) < 0) {
+            if (listen(server_fd_, 128) < 0) {
                 close(server_fd_);
                 server_fd_ = -1;
                 return false;
@@ -46,7 +129,7 @@ namespace NetPulse {
         void run() {
             if (server_fd_ < 0) return;
 
-            std::cout << "NetPulse core running on port " << port_ << "..." << std::endl;
+            std::cout << "NetPulse core running on port " << port_ << " with ThreadPool..." << std::endl;
 
             while (true) {
                 int client_fd = accept(server_fd_, nullptr, nullptr);
@@ -54,19 +137,21 @@ namespace NetPulse {
                     continue;
                 }
 
-                char buffer[1024] = {0};
-                read(client_fd, buffer, sizeof(buffer));
+                pool_.enqueue([client_fd]() {
+                    char buffer[1024] = {0};
+                    read(client_fd, buffer, sizeof(buffer));
 
-                std::string body = "{\"core\": \"NetPulse Engine\", \"active\": true}";
-                std::string response =
-                    "HTTP/1.1 200 OK\r\n"
-                    "Content-Type: application/json\r\n"
-                    "Content-Length: " + std::to_string(body.length()) + "\r\n"
-                    "Connection: close\r\n"
-                    "\r\n" + body;
+                    std::string body = "{\"core\": \"NetPulse Engine\", \"async\": true}";
+                    std::string response =
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Content-Length: " + std::to_string(body.length()) + "\r\n"
+                        "Connection: close\r\n"
+                        "\r\n" + body;
 
-                send(client_fd, response.c_str(), response.length(), 0);
-                close(client_fd);
+                    send(client_fd, response.c_str(), response.length(), 0);
+                    close(client_fd);
+                });
             }
         }
 
@@ -80,11 +165,12 @@ namespace NetPulse {
     private:
         int port_;
         int server_fd_;
+        Net::ThreadPool pool_;
     };
 }
 
 int main() {
-    NetPulse::Server server(8080);
+    NetPulse::Server server(8080, 8);
     if (!server.start()) {
         return 1;
     }
